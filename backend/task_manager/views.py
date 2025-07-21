@@ -1,32 +1,60 @@
 from deeptalk.utils import get_deeptalk_user_from_request
-from django.views.decorators.csrf import csrf_exempt
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework import status, permissions
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.response import Response
-from rest_framework import status
-from .models import (
-    Task,
-    TaskCategory, UserPreferences, TaskDependency, TaskLog, Reminder
-)
-from .serializers import (
-    TaskSerializer, TaskCategorySerializer, 
-    UserPreferencesSerializer
-)
+from rest_framework.authentication import SessionAuthentication, TokenAuthentication
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
 from django.utils import timezone
 from django.db.models import Q, Count
+from django.db import transaction
 from datetime import timedelta
-from .utils import create_task_log
-# ===================================
 import logging
+
+from .models import (
+    Task, TaskCategory, UserPreferences, TaskDependency, TaskLog, Reminder
+)
+from .serializers import (
+    TaskSerializer, TaskCategorySerializer, UserPreferencesSerializer
+)
+from .utils import create_task_log
+
 logger = logging.getLogger(__name__)
-@csrf_exempt
+
+# ===================================
+# CUSTOM AUTHENTICATION & PERMISSIONS
+# ===================================
+
+def get_authenticated_deeptalk_user(request):
+    """Get authenticated DeepTalkUser from request"""
+    # First ensure the user is authenticated via DRF
+    if not hasattr(request, 'user') or not request.user.is_authenticated:
+        return None
+    
+    # Then get the corresponding DeepTalkUser
+    return get_deeptalk_user_from_request(request)
+
+class IsOwnerOrReadOnly(permissions.BasePermission):
+    """Custom permission: owners can edit, others can read"""
+    
+    def has_object_permission(self, request, view, obj):
+        # Read permissions for any request
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        # Write permissions only to the owner
+        return obj.user == request.user
+
+# ===================================
+# TASK MANAGEMENT ENDPOINTS
+# ===================================
+
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def tasks_list_create(request):
-    """List tasks or create new task - SIMPLIFIED"""
+    """List tasks or create new task with proper authentication"""
     
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    
+    deeptalk_user = get_authenticated_deeptalk_user(request)
     if not deeptalk_user:
         return Response({
             'error': 'Authentication required',
@@ -34,14 +62,14 @@ def tasks_list_create(request):
         }, status=status.HTTP_401_UNAUTHORIZED)
     
     if request.method == 'GET':
-        # List tasks with optional filtering
         try:
             # Get query parameters
             status_filter = request.GET.get('status')
             search_query = request.GET.get('search')
+            category_filter = request.GET.get('category')
             
-            # Base queryset - exclude soft deleted
-            tasks = Task.objects.filter(
+            # Optimized queryset - prevent N+1 queries
+            tasks = Task.objects.select_related('category').filter(
                 user=deeptalk_user, 
                 deleted_at__isnull=True
             ).order_by('-created_at')
@@ -50,14 +78,29 @@ def tasks_list_create(request):
             if status_filter:
                 tasks = tasks.filter(status=status_filter)
             
+            if category_filter:
+                tasks = tasks.filter(category_id=category_filter)
+            
             if search_query:
-                from django.db.models import Q
                 tasks = tasks.filter(
                     Q(name__icontains=search_query) |
-                    Q(description__icontains=search_query)
+                    Q(description__icontains=search_query) |
+                    Q(tags__contains=[search_query])
                 )
             
-            # Serialize and return
+            # Pagination
+            paginator = PageNumberPagination()
+            paginator.page_size = 20
+            page = paginator.paginate_queryset(tasks, request)
+            
+            if page is not None:
+                serializer = TaskSerializer(page, many=True)
+                return paginator.get_paginated_response({
+                    'tasks': serializer.data,
+                    'status': 'success'
+                })
+            
+            # Fallback without pagination
             serializer = TaskSerializer(tasks, many=True)
             return Response({
                 'tasks': serializer.data,
@@ -66,7 +109,7 @@ def tasks_list_create(request):
             })
             
         except Exception as e:
-            logger.error(f"Error loading tasks: {e}")
+            logger.error(f"Error loading tasks for user {deeptalk_user.id}: {e}")
             return Response({
                 'error': 'Failed to load tasks',
                 'tasks': [],
@@ -74,66 +117,68 @@ def tasks_list_create(request):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     elif request.method == 'POST':
-        # Create new task
         try:
-            serializer = TaskSerializer(data=request.data)
-            if serializer.is_valid():
-                task = serializer.save(user=deeptalk_user)
-                
-                return Response({
-                    'message': 'Task created successfully',
-                    'task': TaskSerializer(task).data,
-                    'status': 'success'
-                }, status=status.HTTP_201_CREATED)
-            else:
-                return Response({
-                    'error': 'Invalid task data',
-                    'details': serializer.errors
-                }, status=status.HTTP_400_BAD_REQUEST)
-                
+            with transaction.atomic():
+                serializer = TaskSerializer(data=request.data)
+                if serializer.is_valid():
+                    task = serializer.save(user=deeptalk_user)
+                    
+                    # Create task log
+                    create_task_log(
+                        task=task, 
+                        user=deeptalk_user, 
+                        action='created',
+                        triggered_by='user'
+                    )
+                    
+                    return Response({
+                        'message': 'Task created successfully',
+                        'task': TaskSerializer(task).data,
+                        'status': 'success'
+                    }, status=status.HTTP_201_CREATED)
+                else:
+                    return Response({
+                        'error': 'Invalid task data',
+                        'details': serializer.errors
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                    
         except Exception as e:
-            logger.error(f"Error creating task: {e}")
+            logger.error(f"Error creating task for user {deeptalk_user.id}: {e}")
             return Response({
                 'error': 'Failed to create task',
                 'message': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-# ===================================
-# TASK MANAGEMENT ENDPOINTS
-# ===================================
-
-
-@csrf_exempt
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def task_detail(request, task_id):
-    """Get, update, or delete a specific task - CLEANED UP"""
+    """Get, update, or delete a specific task with ownership validation"""
     
-    deeptalk_user = get_deeptalk_user_from_request(request)
+    deeptalk_user = get_authenticated_deeptalk_user(request)
     if not deeptalk_user:
         return Response({
             'error': 'Authentication required'
         }, status=status.HTTP_401_UNAUTHORIZED)
     
-    # Get the task
+    # Get the task with ownership validation
     try:
-        task = Task.objects.get(
+        task = Task.objects.select_related('category').get(
             id=task_id, 
             user=deeptalk_user, 
             deleted_at__isnull=True
         )
     except Task.DoesNotExist:
         return Response({
-            'error': 'Task not found'
+            'error': 'Task not found or access denied'
         }, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
-        logger.error(f"Error finding task {task_id}: {e}")
+        logger.error(f"Error finding task {task_id} for user {deeptalk_user.id}: {e}")
         return Response({
             'error': 'Invalid task ID'
         }, status=status.HTTP_400_BAD_REQUEST)
     
     if request.method == 'GET':
-        # Return task details
         serializer = TaskSerializer(task)
         return Response({
             'task': serializer.data,
@@ -141,63 +186,87 @@ def task_detail(request, task_id):
         })
     
     elif request.method == 'PUT':
-        # Update task
         try:
-            serializer = TaskSerializer(task, data=request.data, partial=True)
-            if serializer.is_valid():
-                # Handle status changes
-                if 'status' in request.data:
-                    new_status = request.data['status']
-                    if new_status == 'completed' and task.status != 'completed':
-                        task.completed_at = timezone.now()
-                        task.completion_percentage = 100
-                    elif new_status != 'completed' and task.status == 'completed':
-                        task.completed_at = None
-                        task.completion_percentage = 0
+            with transaction.atomic():
+                previous_values = TaskSerializer(task).data
                 
-                updated_task = serializer.save()
-                
-                return Response({
-                    'message': 'Task updated successfully',
-                    'task': TaskSerializer(updated_task).data,
-                    'status': 'success'
-                })
-            else:
-                return Response({
-                    'error': 'Invalid data',
-                    'details': serializer.errors
-                }, status=status.HTTP_400_BAD_REQUEST)
-                
+                serializer = TaskSerializer(task, data=request.data, partial=True)
+                if serializer.is_valid():
+                    # Handle status changes
+                    if 'status' in request.data:
+                        new_status = request.data['status']
+                        if new_status == 'completed' and task.status != 'completed':
+                            task.completed_at = timezone.now()
+                            task.completion_percentage = 100
+                        elif new_status != 'completed' and task.status == 'completed':
+                            task.completed_at = None
+                            if 'completion_percentage' not in request.data:
+                                task.completion_percentage = 0
+                    
+                    updated_task = serializer.save()
+                    
+                    # Create task log
+                    create_task_log(
+                        task=updated_task, 
+                        user=deeptalk_user, 
+                        action='updated',
+                        previous_values=previous_values,
+                        new_values=TaskSerializer(updated_task).data,
+                        triggered_by='user'
+                    )
+                    
+                    return Response({
+                        'message': 'Task updated successfully',
+                        'task': TaskSerializer(updated_task).data,
+                        'status': 'success'
+                    })
+                else:
+                    return Response({
+                        'error': 'Invalid data',
+                        'details': serializer.errors
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                    
         except Exception as e:
-            logger.error(f"Error updating task {task_id}: {e}")
+            logger.error(f"Error updating task {task_id} for user {deeptalk_user.id}: {e}")
             return Response({
                 'error': 'Failed to update task'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     elif request.method == 'DELETE':
-        # Soft delete task
         try:
-            task.deleted_at = timezone.now()
-            task.save()
-            
-            return Response({
-                'message': 'Task deleted successfully',
-                'status': 'success'
-            }, status=status.HTTP_200_OK)
-            
+            with transaction.atomic():
+                previous_values = TaskSerializer(task).data
+                
+                task.deleted_at = timezone.now()
+                task.save()
+                
+                # Create task log
+                create_task_log(
+                    task=task, 
+                    user=deeptalk_user, 
+                    action='deleted',
+                    previous_values=previous_values,
+                    triggered_by='user'
+                )
+                
+                return Response({
+                    'message': 'Task deleted successfully',
+                    'status': 'success'
+                }, status=status.HTTP_200_OK)
+                
         except Exception as e:
-            logger.error(f"Error deleting task {task_id}: {e}")
+            logger.error(f"Error deleting task {task_id} for user {deeptalk_user.id}: {e}")
             return Response({
                 'error': 'Failed to delete task'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def task_toggle_status(request, task_id):
-    """Toggle task between pending and completed - FIXED"""
+    """Toggle task between pending and completed with ownership validation"""
     
-    deeptalk_user = get_deeptalk_user_from_request(request)
+    deeptalk_user = get_authenticated_deeptalk_user(request)
     if not deeptalk_user:
         return Response({
             'error': 'Authentication required'
@@ -211,57 +280,70 @@ def task_toggle_status(request, task_id):
         )
     except Task.DoesNotExist:
         return Response({
-            'error': 'Task not found'
+            'error': 'Task not found or access denied'
         }, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
-        logger.error(f"Error finding task {task_id}: {e}")
+        logger.error(f"Error finding task {task_id} for user {deeptalk_user.id}: {e}")
         return Response({
             'error': 'Invalid task ID'
         }, status=status.HTTP_400_BAD_REQUEST)
     
     try:
-        # Toggle status
-        if task.status == 'completed':
-            task.status = 'pending'
-            task.completed_at = None
-            task.completion_percentage = 0
-            action = 'reopened'
-        else:
-            task.status = 'completed'
-            task.completed_at = timezone.now()
-            task.completion_percentage = 100
-            action = 'completed'
-        
-        task.save()
-        
-        return Response({
-            'message': f'Task {action} successfully',
-            'task': TaskSerializer(task).data,
-            'action': action,
-            'status': 'success'
-        })
-        
+        with transaction.atomic():
+            previous_values = TaskSerializer(task).data
+            
+            # Toggle status
+            if task.status == 'completed':
+                task.status = 'pending'
+                task.completed_at = None
+                task.completion_percentage = 0
+                action = 'reopened'
+            else:
+                task.status = 'completed'
+                task.completed_at = timezone.now()
+                task.completion_percentage = 100
+                action = 'completed'
+            
+            task.save()
+            
+            # Create task log
+            create_task_log(
+                task=task, 
+                user=deeptalk_user, 
+                action=action,
+                previous_values=previous_values,
+                new_values=TaskSerializer(task).data,
+                triggered_by='user'
+            )
+            
+            return Response({
+                'message': f'Task {action} successfully',
+                'task': TaskSerializer(task).data,
+                'action': action,
+                'status': 'success'
+            })
+            
     except Exception as e:
-        logger.error(f"Error toggling task {task_id}: {e}")
+        logger.error(f"Error toggling task {task_id} for user {deeptalk_user.id}: {e}")
         return Response({
             'error': 'Failed to toggle task status'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@csrf_exempt
 @api_view(['GET'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def task_stats(request):
-    """Get task statistics for the user - SIMPLIFIED"""
+    """Get task statistics for the authenticated user"""
     
-    deeptalk_user = get_deeptalk_user_from_request(request)
+    deeptalk_user = get_authenticated_deeptalk_user(request)
     if not deeptalk_user:
         return Response({
             'error': 'Authentication required'
         }, status=status.HTTP_401_UNAUTHORIZED)
     
     try:
-        # Base queryset
-        tasks = Task.objects.filter(
+        # Optimized queryset with select_related
+        tasks = Task.objects.select_related('category').filter(
             user=deeptalk_user, 
             deleted_at__isnull=True
         )
@@ -290,24 +372,26 @@ def task_stats(request):
         ).count()
         recent_created = tasks.filter(created_at__gte=last_week).count()
         
-        # Category breakdown (simplified)
+        # Category breakdown (optimized query)
         category_stats = []
         try:
-            category_data = tasks.values('category__name').annotate(
+            category_data = tasks.exclude(category__isnull=True).values(
+                'category__name'
+            ).annotate(
                 total=Count('id'),
                 completed_count=Count('id', filter=Q(status='completed'))
-            ).order_by('-total')[:5]  # Top 5 categories only
+            ).order_by('-total')[:5]
             
-            for item in category_data:
-                if item['category__name']:  # Skip None categories
-                    category_stats.append({
-                        'category': item['category__name'],
-                        'total': item['total'],
-                        'completed': item['completed_count']
-                    })
+            category_stats = [
+                {
+                    'category': item['category__name'],
+                    'total': item['total'],
+                    'completed': item['completed_count']
+                }
+                for item in category_data
+            ]
         except Exception as e:
-            logger.error(f"Error calculating category stats: {e}")
-            # Continue without category stats
+            logger.error(f"Error calculating category stats for user {user.id}: {e}")
         
         return Response({
             'total': total,
@@ -325,7 +409,7 @@ def task_stats(request):
         })
         
     except Exception as e:
-        logger.error(f"Error calculating task stats: {e}")
+        logger.error(f"Error calculating task stats for user {user.id}: {e}")
         return Response({
             'error': 'Failed to calculate statistics',
             'total': 0,
@@ -337,99 +421,99 @@ def task_stats(request):
             'status': 'error'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
-@csrf_exempt
 @api_view(['GET'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def productivity_insights(request):
-    """Get productivity insights for the user"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+    """Get productivity insights for the authenticated user"""
     
+    user = request.user
     days = int(request.GET.get('days', 7))
     start_date = timezone.now() - timedelta(days=days)
     
-    tasks = Task.objects.filter(
-        user=deeptalk_user, 
-        deleted_at__isnull=True,
-        created_at__gte=start_date
-    )
-    
-    completed_tasks = tasks.filter(
-        status='completed',
-        completed_at__gte=start_date
-    )
-    
-    insights = {
-        'period_days': days,
-        'tasks_created': tasks.count(),
-        'tasks_completed': completed_tasks.count(),
-        'completion_rate': round((completed_tasks.count() / tasks.count() * 100) if tasks.count() > 0 else 0, 2),
-        'average_completion_time': None,
-        'most_productive_day': None,
-        'preferred_categories': [],
-        'daily_completion_trend': {}
-    }
-    
-    # Calculate average completion time
-    if completed_tasks.exists():
-        completion_times = []
-        for task in completed_tasks:
-            if task.completed_at and task.created_at:
-                time_diff = (task.completed_at - task.created_at).total_seconds() / 3600  # hours
-                completion_times.append(time_diff)
+    try:
+        tasks = Task.objects.filter(
+            user=user, 
+            deleted_at__isnull=True,
+            created_at__gte=start_date
+        )
         
-        if completion_times:
-            insights['average_completion_time'] = round(sum(completion_times) / len(completion_times), 2)
-    
-    # Find most productive day
-    daily_completion = {}
-    for task in completed_tasks:
-        if task.completed_at:
-            day = task.completed_at.strftime('%A')
-            daily_completion[day] = daily_completion.get(day, 0) + 1
-    
-    if daily_completion:
-        insights['most_productive_day'] = max(daily_completion, key=daily_completion.get)
-        insights['daily_completion_trend'] = daily_completion
-    
-    # Find preferred categories
-    category_count = {}
-    for task in tasks:
-        if task.category:
-            cat_name = task.category.name
-            category_count[cat_name] = category_count.get(cat_name, 0) + 1
-    
-    insights['preferred_categories'] = [
-        {'category': cat, 'count': count} 
-        for cat, count in sorted(category_count.items(), key=lambda x: x[1], reverse=True)[:3]
-    ]
-    
-    return Response(insights)
-
+        completed_tasks = tasks.filter(
+            status='completed',
+            completed_at__gte=start_date
+        )
+        
+        insights = {
+            'period_days': days,
+            'tasks_created': tasks.count(),
+            'tasks_completed': completed_tasks.count(),
+            'completion_rate': round((completed_tasks.count() / tasks.count() * 100) if tasks.count() > 0 else 0, 2),
+            'average_completion_time': None,
+            'most_productive_day': None,
+            'preferred_categories': [],
+            'daily_completion_trend': {}
+        }
+        
+        # Calculate average completion time
+        if completed_tasks.exists():
+            completion_times = []
+            for task in completed_tasks:
+                if task.completed_at and task.created_at:
+                    time_diff = (task.completed_at - task.created_at).total_seconds() / 3600
+                    completion_times.append(time_diff)
+            
+            if completion_times:
+                insights['average_completion_time'] = round(sum(completion_times) / len(completion_times), 2)
+        
+        # Find most productive day
+        daily_completion = {}
+        for task in completed_tasks:
+            if task.completed_at:
+                day = task.completed_at.strftime('%A')
+                daily_completion[day] = daily_completion.get(day, 0) + 1
+        
+        if daily_completion:
+            insights['most_productive_day'] = max(daily_completion, key=daily_completion.get)
+            insights['daily_completion_trend'] = daily_completion
+        
+        # Find preferred categories
+        category_count = {}
+        for task in tasks.select_related('category'):
+            if task.category:
+                cat_name = task.category.name
+                category_count[cat_name] = category_count.get(cat_name, 0) + 1
+        
+        insights['preferred_categories'] = [
+            {'category': cat, 'count': count} 
+            for cat, count in sorted(category_count.items(), key=lambda x: x[1], reverse=True)[:3]
+        ]
+        
+        return Response(insights)
+        
+    except Exception as e:
+        logger.error(f"Error calculating productivity insights for user {user.id}: {e}")
+        return Response({
+            'error': 'Failed to calculate insights'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # ===================================
 # TASK CATEGORY ENDPOINTS
 # ===================================
 
-@csrf_exempt
 @api_view(['GET', 'POST'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def categories_list_create(request):
-    """List categories or create new category"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({
-            'error': 'Authentication required'
-        }, status=status.HTTP_401_UNAUTHORIZED)
+    """List categories or create new category with proper authentication"""
+    
+    user = request.user
     
     if request.method == 'GET':
         try:
             # Get user's categories and system categories
             categories = TaskCategory.objects.filter(
-                Q(user=deeptalk_user) | Q(is_system_category=True)
-            ).distinct()
+                Q(user=user) | Q(is_system_category=True)
+            ).distinct().order_by('name')
             
             serializer = TaskCategorySerializer(categories, many=True)
             return Response({
@@ -437,16 +521,16 @@ def categories_list_create(request):
                 'status': 'success'
             })
         except Exception as e:
-            logger.error(f"Error loading categories: {e}")
+            logger.error(f"Error loading categories for user {user.id}: {e}")
             return Response({
                 'categories': [],
                 'error': 'Failed to load categories'
-            })
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     elif request.method == 'POST':
         try:
             data = request.data.copy()
-            data['user'] = deeptalk_user.id
+            data['user'] = user.id
             data['is_system_category'] = False
             
             serializer = TaskCategorySerializer(data=data)
@@ -463,31 +547,28 @@ def categories_list_create(request):
                     'details': serializer.errors
                 }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Error creating category: {e}")
+            logger.error(f"Error creating category for user {user.id}: {e}")
             return Response({
                 'error': 'Failed to create category'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@csrf_exempt
 @api_view(['GET', 'PUT', 'DELETE'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def category_detail(request, category_id):
-    """Get, update, or delete a specific category"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({
-            'error': 'Authentication required'
-        }, status=status.HTTP_401_UNAUTHORIZED)
+    """Get, update, or delete a specific category with ownership validation"""
+    
+    user = request.user
     
     try:
         category = TaskCategory.objects.get(
             id=category_id, 
-            user=deeptalk_user,
-            is_system_category=False  # Only allow editing user categories
+            user=user,
+            is_system_category=False
         )
     except TaskCategory.DoesNotExist:
         return Response({
-            'error': 'Category not found'
+            'error': 'Category not found or access denied'
         }, status=status.HTTP_404_NOT_FOUND)
     
     if request.method == 'GET':
@@ -513,7 +594,7 @@ def category_detail(request, category_id):
                     'details': serializer.errors
                 }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Error updating category: {e}")
+            logger.error(f"Error updating category {category_id} for user {user.id}: {e}")
             return Response({
                 'error': 'Failed to update category'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -532,7 +613,7 @@ def category_detail(request, category_id):
                 'status': 'success'
             })
         except Exception as e:
-            logger.error(f"Error deleting category: {e}")
+            logger.error(f"Error deleting category {category_id} for user {user.id}: {e}")
             return Response({
                 'error': 'Failed to delete category'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -541,21 +622,17 @@ def category_detail(request, category_id):
 # USER PREFERENCES ENDPOINTS
 # ===================================
 
-@csrf_exempt
 @api_view(['GET', 'PUT'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def user_preferences(request):
-    """Get or update user preferences"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({
-            'error': 'Authentication required'
-        }, status=status.HTTP_401_UNAUTHORIZED)
+    """Get or update user preferences with proper authentication"""
     
-    # Get or create preferences
+    user = request.user
+    
     try:
         preferences, created = UserPreferences.objects.get_or_create(
-            user=deeptalk_user,
+            user=user,
             defaults={
                 'work_start_time': '09:00:00',
                 'work_end_time': '17:00:00',
@@ -564,7 +641,7 @@ def user_preferences(request):
             }
         )
     except Exception as e:
-        logger.error(f"Error getting preferences: {e}")
+        logger.error(f"Error getting preferences for user {user.id}: {e}")
         return Response({
             'error': 'Failed to load preferences'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -577,7 +654,7 @@ def user_preferences(request):
                 'status': 'success'
             })
         except Exception as e:
-            logger.error(f"Error serializing preferences: {e}")
+            logger.error(f"Error serializing preferences for user {user.id}: {e}")
             return Response({
                 'error': 'Failed to load preferences'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -598,25 +675,22 @@ def user_preferences(request):
                     'details': serializer.errors
                 }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
-            logger.error(f"Error updating preferences: {e}")
+            logger.error(f"Error updating preferences for user {user.id}: {e}")
             return Response({
                 'error': 'Failed to update preferences'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 
 # ===================================
 # BULK OPERATIONS
 # ===================================
 
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def bulk_update_tasks(request):
-    """Bulk update multiple tasks"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+    """Bulk update multiple tasks with ownership validation"""
     
+    user = request.user
     task_ids = request.data.get('task_ids', [])
     updates = request.data.get('updates', {})
     
@@ -625,53 +699,68 @@ def bulk_update_tasks(request):
             'error': 'task_ids and updates are required'
         }, status=status.HTTP_400_BAD_REQUEST)
     
-    # Get tasks
-    tasks = Task.objects.filter(
-        id__in=task_ids,
-        user=deeptalk_user,
-        deleted_at__isnull=True
-    )
-    
-    updated_tasks = []
-    for task in tasks:
-        previous_values = TaskSerializer(task).data
-        
-        # Apply updates
-        for field, value in updates.items():
-            if hasattr(task, field):
-                setattr(task, field, value)
-        
-        # Handle status changes
-        if 'status' in updates:
-            if updates['status'] == 'completed' and task.status != 'completed':
-                task.completed_at = timezone.now()
-                task.completion_percentage = 100
-        
-        task.save()
-        
-        # Create task log
-        create_task_log(task, deeptalk_user, 'updated', 
-                      previous_values=previous_values, 
-                      new_values=TaskSerializer(task).data,
-                      triggered_by='user')
-        
-        updated_tasks.append(TaskSerializer(task).data)
-    
-    return Response({
-        'message': f'Updated {len(updated_tasks)} tasks',
-        'updated_tasks': updated_tasks
-    })
+    try:
+        with transaction.atomic():
+            # Get tasks with ownership validation
+            tasks = Task.objects.filter(
+                id__in=task_ids,
+                user=user,
+                deleted_at__isnull=True
+            )
+            
+            if not tasks.exists():
+                return Response({
+                    'error': 'No accessible tasks found'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            updated_tasks = []
+            for task in tasks:
+                previous_values = TaskSerializer(task).data
+                
+                # Apply updates
+                for field, value in updates.items():
+                    if hasattr(task, field):
+                        setattr(task, field, value)
+                
+                # Handle status changes
+                if 'status' in updates:
+                    if updates['status'] == 'completed' and task.status != 'completed':
+                        task.completed_at = timezone.now()
+                        task.completion_percentage = 100
+                
+                task.save()
+                
+                # Create task log
+                create_task_log(
+                    task=task, 
+                    user=user, 
+                    action='updated', 
+                    previous_values=previous_values, 
+                    new_values=TaskSerializer(task).data,
+                    triggered_by='user'
+                )
+                
+                updated_tasks.append(TaskSerializer(task).data)
+            
+            return Response({
+                'message': f'Updated {len(updated_tasks)} tasks',
+                'updated_tasks': updated_tasks,
+                'status': 'success'
+            })
+            
+    except Exception as e:
+        logger.error(f"Error bulk updating tasks for user {user.id}: {e}")
+        return Response({
+            'error': 'Failed to update tasks'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
-@csrf_exempt
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def bulk_delete_tasks(request):
-    """Bulk delete multiple tasks"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+    """Bulk delete multiple tasks with ownership validation"""
     
+    user = request.user
     task_ids = request.data.get('task_ids', [])
     
     if not task_ids:
@@ -679,74 +768,122 @@ def bulk_delete_tasks(request):
             'error': 'task_ids is required'
         }, status=status.HTTP_400_BAD_REQUEST)
     
-    # Get tasks
-    tasks = Task.objects.filter(
-        id__in=task_ids,
-        user=deeptalk_user,
-        deleted_at__isnull=True
-    )
-    
-    deleted_count = 0
-    for task in tasks:
-        previous_values = TaskSerializer(task).data
-        task.soft_delete()
-        
-        # Create task log
-        create_task_log(task, deeptalk_user, 'deleted', 
-                      previous_values=previous_values,
-                      triggered_by='user')
-        
-        deleted_count += 1
-    
-    return Response({
-        'message': f'Deleted {deleted_count} tasks'
-    })
-
+    try:
+        with transaction.atomic():
+            # Get tasks with ownership validation
+            tasks = Task.objects.filter(
+                id__in=task_ids,
+                user=user,
+                deleted_at__isnull=True
+            )
+            
+            if not tasks.exists():
+                return Response({
+                    'error': 'No accessible tasks found'
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            deleted_count = 0
+            for task in tasks:
+                previous_values = TaskSerializer(task).data
+                task.deleted_at = timezone.now()
+                task.save()
+                
+                # Create task log
+                create_task_log(
+                    task=task, 
+                    user=user, 
+                    action='deleted', 
+                    previous_values=previous_values,
+                    triggered_by='user'
+                )
+                
+                deleted_count += 1
+            
+            return Response({
+                'message': f'Deleted {deleted_count} tasks',
+                'status': 'success'
+            })
+            
+    except Exception as e:
+        logger.error(f"Error bulk deleting tasks for user {user.id}: {e}")
+        return Response({
+            'error': 'Failed to delete tasks'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # ===================================
 # SEARCH ENDPOINT
 # ===================================
 
-@csrf_exempt
 @api_view(['GET'])
-@permission_classes([AllowAny])
+@authentication_classes([SessionAuthentication, TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def search_tasks(request):
-    """Advanced task search"""
-    deeptalk_user = get_deeptalk_user_from_request(request)
-    if not deeptalk_user:
-        return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+    """Advanced task search with proper authentication"""
     
+    user = request.user
     query = request.GET.get('q', '')
+    
     if not query:
-        return Response({'error': 'Search query is required'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'error': 'Search query is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
     
-    # Search in multiple fields
-    tasks = Task.objects.filter(
-        user=deeptalk_user,
-        deleted_at__isnull=True
-    ).filter(
-        Q(name__icontains=query) |
-        Q(description__icontains=query) |
-        Q(tags__contains=[query]) |
-        Q(location__icontains=query) |
-        Q(category__name__icontains=query)
-    ).distinct()
-    
-    # Apply additional filters
-    status_filter = request.GET.get('status')
-    if status_filter:
-        tasks = tasks.filter(status=status_filter)
-    
-    priority_filter = request.GET.get('priority')
-    if priority_filter:
-        tasks = tasks.filter(priority=int(priority_filter))
-    
-    # Order by created date for SQLite compatibility
-    tasks = tasks.order_by('-created_at')
-    
-    serializer = TaskSerializer(tasks, many=True)
-    return Response({
-        'tasks': serializer.data,
-        'total_count': tasks.count(),
-        'query': query
-    })
+    try:
+        # Optimized search query with select_related
+        tasks = Task.objects.select_related('category').filter(
+            user=user,
+            deleted_at__isnull=True
+        ).filter(
+            Q(name__icontains=query) |
+            Q(description__icontains=query) |
+            Q(tags__contains=[query]) |
+            Q(location__icontains=query) |
+            Q(category__name__icontains=query)
+        ).distinct()
+        
+        # Apply additional filters
+        status_filter = request.GET.get('status')
+        if status_filter:
+            tasks = tasks.filter(status=status_filter)
+        
+        priority_filter = request.GET.get('priority')
+        if priority_filter:
+            tasks = tasks.filter(priority=int(priority_filter))
+        
+        category_filter = request.GET.get('category')
+        if category_filter:
+            tasks = tasks.filter(category_id=category_filter)
+        
+        # Order by relevance (created date for now)
+        tasks = tasks.order_by('-created_at')
+        
+        # Pagination
+        paginator = PageNumberPagination()
+        paginator.page_size = 20
+        page = paginator.paginate_queryset(tasks, request)
+        
+        if page is not None:
+            serializer = TaskSerializer(page, many=True)
+            return paginator.get_paginated_response({
+                'tasks': serializer.data,
+                'query': query,
+                'status': 'success'
+            })
+        
+        # Fallback without pagination
+        serializer = TaskSerializer(tasks, many=True)
+        return Response({
+            'tasks': serializer.data,
+            'total_count': tasks.count(),
+            'query': query,
+            'status': 'success'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error searching tasks for user {user.id}: {e}")
+        return Response({
+            'error': 'Search failed',
+            'tasks': [],
+            'total_count': 0,
+            'query': query
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
